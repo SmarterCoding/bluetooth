@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="km">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>Mobile Khmer Bluetooth Printer</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Khmer:wght@400;700&display=swap" rel="stylesheet">
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            margin: 0;
+            padding: 16px;
+            padding-bottom: max(16px, env(safe-area-inset-bottom));
+            background: #f3f4f6;
+            font-family: Arial, sans-serif;
+            color: #111827;
+        }
+
+        .app {
+            max-width: 560px;
+            margin: auto;
+            background: white;
+            border-radius: 14px;
+            padding: 20px;
+            box-shadow: 0 5px 22px #00000012;
+        }
+
+        h2 {
+            text-align: center;
+        }
+
+        .khmer {
+            font-family: "Noto Sans Khmer", sans-serif;
+            line-height: 1.9;
+        }
+
+        .status {
+            padding: 12px;
+            margin: 14px 0;
+            border-radius: 8px;
+            background: #f3f4f6;
+            overflow-wrap: anywhere;
+        }
+
+        .status.ok {
+            background: #dcfce7;
+            color: #166534;
+        }
+
+        .status.err {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        button {
+            width: 100%;
+            min-height: 48px;
+            margin: 7px 0;
+            padding: 12px;
+            border: 0;
+            border-radius: 8px;
+            color: white;
+            background: #2563eb;
+            font-size: 16px;
+            font-weight: 600;
+            touch-action: manipulation;
+        }
+
+        button:disabled {
+            opacity: .45;
+        }
+
+        #receiptButton {
+            background: #059669;
+        }
+
+        #khmerButton {
+            background: #7c3aed;
+        }
+
+        #disconnectButton {
+            background: #6b7280;
+        }
+
+        #clearButton {
+            background: #dc2626;
+        }
+
+        .preview {
+            margin: 16px 0;
+            padding: 14px;
+            border: 1px dashed #9ca3af;
+            text-align: center;
+        }
+
+        #log {
+            margin-top: 14px;
+            padding: 12px;
+            background: #111827;
+            color: #d1fae5;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            font: 12px/1.5 monospace;
+        }
+
+        small {
+            color: #6b7280;
+            line-height: 1.6;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="app">
+        <h2>Khmer Bluetooth Printer</h2>
+
+        <div id="status" class="status">Ready to connect</div>
+        <div id="saved"></div>
+
+        <button id="connectButton">Connect Bluetooth Printer</button>
+        <button id="receiptButton" disabled>Print Sample Receipt</button>
+        <button id="khmerButton" disabled>Print Khmer Test</button>
+        <button id="disconnectButton" disabled>Disconnect</button>
+        <button id="clearButton">Clear Saved Label</button>
+
+        <div class="preview">
+            <strong>Khmer Preview</strong>
+            <div class="khmer">សួស្តី កម្ពុជា</div>
+            <div class="khmer">វិក្កយបត្រ</div>
+            <div class="khmer">ប្រាក់ត្រូវបង់: ១០,០០០ ៛</div>
+        </div>
+
+        <small>
+            Requires Chrome with Web Bluetooth support, a BLE-compatible
+            ESC/POS printer, and HTTPS or localhost.
+        </small>
+
+        <div id="log">Printer not connected.</div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/web-escpos-printer/build/web-escpos-printer.js"></script>
+
+    <script>
+        (() => {
+            'use strict';
+
+            const STORAGE_KEY = 'mobile_khmer_printer_label';
+
+            const $ = id => document.getElementById(id);
+
+            let printer = null;
+            let connected = false;
+            let busy = false;
+
+            function log(message) {
+                $('log').textContent +=
+                    '\n' + new Date().toLocaleTimeString() + ' ' + message;
+            }
+
+            function status(message, type = '') {
+                $('status').textContent = message;
+                $('status').className = 'status ' + type;
+            }
+
+            function updateButtons() {
+                $('connectButton').disabled = busy || connected;
+                $('receiptButton').disabled = busy || !connected;
+                $('khmerButton').disabled = busy || !connected;
+                $('disconnectButton').disabled = busy || !connected;
+                $('clearButton').disabled = busy;
+            }
+
+            function loadSavedLabel() {
+                try {
+                    const label = localStorage.getItem(STORAGE_KEY);
+                    $('saved').textContent = label
+                        ? 'Previously selected: ' + label
+                        : 'No saved printer label.';
+                } catch (_) {
+                    $('saved').textContent = 'Browser storage unavailable.';
+                }
+            }
+
+            function savePrinterLabel(name) {
+                try {
+                    localStorage.setItem(
+                        STORAGE_KEY,
+                        name || 'Bluetooth receipt printer'
+                    );
+                } catch (error) {
+                    log('Could not save label: ' + error.message);
+                }
+                loadSavedLabel();
+            }
+
+            // Wait for Noto Sans Khmer before drawing.
+            async function waitForKhmerFont() {
+                await document.fonts.load('400 26px "Noto Sans Khmer"');
+                await document.fonts.load('700 26px "Noto Sans Khmer"');
+                await document.fonts.ready;
+
+                if (!document.fonts.check('400 26px "Noto Sans Khmer"')) {
+                    throw new Error('Khmer font failed to load. Check internet access.');
+                }
+            }
+
+            // Draw shaped Unicode text onto a monochrome-style PNG.
+            async function renderKhmer(text, options = {}) {
+                await waitForKhmerFont();
+
+                const width = options.width || 576;
+                const size = options.fontSize || 26;
+                const padding = 12;
+                const lineHeight = Math.ceil(size * 1.9);
+                const font = `${options.bold ? 700 : 400} ${size}px "Noto Sans Khmer"`;
+
+                const measureCanvas = document.createElement('canvas');
+                const measure = measureCanvas.getContext('2d');
+                measure.font = font;
+
+                const maxWidth = width - padding * 2;
+                const lines = [];
+
+                // Simple word wrapping. For long Khmer paragraphs, add
+                // a Khmer-aware line-breaking algorithm.
+                for (const paragraph of String(text).split('\n')) {
+                    if (!paragraph) {
+                        lines.push('');
+                        continue;
+                    }
+
+                    let line = '';
+
+                    for (const word of paragraph.split(/\s+/)) {
+                        const candidate = line ? line + ' ' + word : word;
+
+                        if (line && measure.measureText(candidate).width > maxWidth) {
+                            lines.push(line);
+                            line = word;
+                        } else {
+                            line = candidate;
+                        }
+                    }
+
+                    if (line) lines.push(line);
+                }
+
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = Math.max(
+                    lineHeight + padding * 2,
+                    lines.length * lineHeight + padding * 2
+                );
+
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = '#fff';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                ctx.font = font;
+                ctx.fillStyle = '#000';
+                ctx.textBaseline = 'top';
+                ctx.textAlign = options.align || 'left';
+
+                const x = options.align === 'center'
+                    ? width / 2
+                    : options.align === 'right'
+                        ? width - padding
+                        : padding;
+
+                lines.forEach((line, index) => {
+                    ctx.fillText(line, x, padding + index * lineHeight);
+                });
+
+                return canvas.toDataURL('image/png');
+            }
+
+            // Bluetooth connection must originate from a user click.
+            $('connectButton').addEventListener('click', async () => {
+                if (busy || connected) return;
+
+                if (!window.isSecureContext) {
+                    status('Use HTTPS or localhost for Bluetooth.', 'err');
+                    return;
+                }
+
+                if (!navigator.bluetooth) {
+                    status('Web Bluetooth is unavailable in this browser.', 'err');
+                    log('Try current Chrome on Android, not iOS Chrome.');
+                    return;
+                }
+
+                if (typeof window.WebEscposPrinter !== 'function') {
+                    status('Printer library did not load.', 'err');
+                    log('Check the CDN URL and internet connection.');
+                    return;
+                }
+
+                busy = true;
+                updateButtons();
+                status('Choose your printer in the Bluetooth dialog...');
+
+                try {
+                    printer = new window.WebEscposPrinter({
+                        paperWidth: '80mm',
+                        imageMode: 'raster'
+                    });
+
+                    // compat broadens the supported printer search.
+                    const info = await printer.connect({
+                        transport: 'bluetooth',
+                        compat: true
+                    });
+
+                    connected = true;
+
+                    const name = info && info.name
+                        ? info.name
+                        : 'Bluetooth receipt printer';
+
+                    savePrinterLabel(name);
+                    status('Connected: ' + name, 'ok');
+                    log('Bluetooth connection established.');
+                } catch (error) {
+                    printer = null;
+                    connected = false;
+                    status('Connection failed: ' + error.message, 'err');
+                    log(error.message || String(error));
+                } finally {
+                    busy = false;
+                    updateButtons();
+                }
+            });
+
+            async function printJob(job) {
+                if (!connected || !printer || busy) return;
+
+                busy = true;
+                updateButtons();
+
+                try {
+                    await printer.printReceipt(job);
+                    status('Print command sent successfully.', 'ok');
+                    log('Print job submitted.');
+                } catch (error) {
+                    status('Printing failed: ' + error.message, 'err');
+                    log(error.message || String(error));
+                } finally {
+                    busy = false;
+                    updateButtons();
+                }
+            }
+
+            $('receiptButton').addEventListener('click', async () => {
+                if (!connected || busy) return;
+
+                busy = true;
+                updateButtons();
+
+                try {
+                    const title = await renderKhmer('វិក្កយបត្រ', {
+                        width: 576, fontSize: 30, bold: true, align: 'center'
+                    });
+
+                    const total = await renderKhmer('ប្រាក់ត្រូវបង់: ១០,០០០ ៛', {
+                        width: 576, fontSize: 25, bold: true
+                    });
+
+                    // Image source is a PNG data URL, supported by this library.
+                    const job = {
+                        content: [
+                            {
+                                type: 'text',
+                                value: 'MY TEST STORE',
+                                align: 'center',
+                                bold: true
+                            },
+                            { type: 'image', source: title },
+                            {
+                                type: 'text',
+                                value: 'Receipt No: TEST-0001',
+                                align: 'left'
+                            },
+                            {
+                                type: 'text',
+                                value: 'Test product      $10.00',
+                                align: 'left'
+                            },
+                            { type: 'image', source: total },
+                            {
+                                type: 'text',
+                                value: 'Thank you!',
+                                align: 'center'
+                            },
+                            {
+                                type: 'qrcode',
+                                value: 'https://example.com',
+                                safeMode: true
+                            }
+                        ],
+                        cut: 'full'
+                    };
+
+                    await printer.printReceipt(job);
+                    status('Receipt sent.', 'ok');
+                    log('Sample receipt submitted.');
+                } catch (error) {
+                    status('Receipt failed: ' + error.message, 'err');
+                    log(error.message || String(error));
+                } finally {
+                    busy = false;
+                    updateButtons();
+                }
+            });
+
+            $('khmerButton').addEventListener('click', async () => {
+                if (!connected || busy) return;
+
+                busy = true;
+                updateButtons();
+
+                try {
+                    const image = await renderKhmer(
+                        'សាកល្បងបោះពុម្ពអក្សរខ្មែរ\n' +
+                        'សួស្តី កម្ពុជា\n' +
+                        'វិក្កយបត្រ\n' +
+                        'ប្រាក់ត្រូវបង់: ១០,០០០ ៛',
+                        {
+                            width: 576,
+                            fontSize: 27,
+                            bold: true,
+                            align: 'center'
+                        }
+                    );
+
+                    await printer.printReceipt({
+                        content: [
+                            { type: 'image', source: image }
+                        ],
+                        cut: 'full'
+                    });
+
+                    status('Khmer test sent.', 'ok');
+                    log('Check the printed Khmer characters.');
+                } catch (error) {
+                    status('Khmer test failed: ' + error.message, 'err');
+                    log(error.message || String(error));
+                } finally {
+                    busy = false;
+                    updateButtons();
+                }
+            });
+
+            $('disconnectButton').addEventListener('click', async () => {
+                if (!printer || busy) return;
+
+                busy = true;
+                updateButtons();
+
+                try {
+                    await printer.disconnect();
+                    connected = false;
+                    printer = null;
+                    status('Disconnected. Saved label retained.');
+                    log('Printer disconnected.');
+                } catch (error) {
+                    status('Disconnect failed: ' + error.message, 'err');
+                } finally {
+                    busy = false;
+                    updateButtons();
+                }
+            });
+
+            $('clearButton').addEventListener('click', () => {
+                try {
+                    localStorage.removeItem(STORAGE_KEY);
+                    loadSavedLabel();
+                    log('Saved label cleared.');
+                } catch (error) {
+                    log(error.message || String(error));
+                }
+            });
+
+            loadSavedLabel();
+
+            if (!window.isSecureContext) {
+                status('HTTPS or localhost is required for Bluetooth.', 'err');
+            } else if (!navigator.bluetooth) {
+                status('Web Bluetooth is not available here.', 'err');
+            }
+        })();
+    </script>
+</body>
+
+</html>
